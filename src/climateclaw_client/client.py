@@ -51,7 +51,7 @@ class ClimateClaw(SyncAPIClient):
         self,
         *,
         base_url: str | URL,
-        token_store_path: str = "",
+        store_path: str = "",
         follow_redirects: bool = True,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
@@ -66,7 +66,7 @@ class ClimateClaw(SyncAPIClient):
 
         Args:
             base_url: Base URL for the ClimateClaw API.
-            token_store_path: Path to store authentication tokens.
+            store_path: Path to store authentication tokens.
             follow_redirects: Whether to follow HTTP redirects.
             timeout: Request timeout in seconds.
             max_retries: Maximum number of retry attempts.
@@ -82,7 +82,7 @@ class ClimateClaw(SyncAPIClient):
         super().__init__(
             version=__version__,
             base_url=base_url,
-            token_store_path=token_store_path,
+            store_path=store_path,
             follow_redirects=follow_redirects,
             max_retries=max_retries,
             timeout=timeout,
@@ -684,7 +684,7 @@ class AsyncClimateClaw(AsyncAPIClient):
         self,
         *,
         base_url: str | URL,
-        token_store_path: str = "",
+        store_path: str = "",
         follow_redirects: bool = True,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
@@ -698,7 +698,7 @@ class AsyncClimateClaw(AsyncAPIClient):
 
         Args:
             base_url: Base URL for the ClimateClaw API.
-            token_store_path: Path to store authentication tokens.
+            store_path: Path to store authentication tokens.
             follow_redirects: Whether to follow HTTP redirects.
             timeout: Request timeout in seconds.
             max_retries: Maximum number of retry attempts.
@@ -712,7 +712,7 @@ class AsyncClimateClaw(AsyncAPIClient):
         super().__init__(
             version=__version__,
             base_url=base_url,
-            token_store_path=token_store_path,
+            store_path=store_path,
             follow_redirects=follow_redirects,
             max_retries=max_retries,
             timeout=timeout,

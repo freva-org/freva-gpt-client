@@ -24,7 +24,7 @@ def make_oidc_token(
         "expires": expires.timestamp(),
         "refresh_token": "ABC",
         "refresh_expires": refresh_expires.timestamp(),
-        "scope": "myinstance",
+        "scope": "openid",
         "headers": {
             "Authorization": "Bearer XYZ",
         },
@@ -32,23 +32,33 @@ def make_oidc_token(
 
 
 @pytest.fixture
-def base_url():
+def base_url() -> httpx.URL:
     """Base URL used for all auth tests."""
     return httpx.URL("https://myinstance.com")
 
 
 @pytest.fixture
-def default_token_store_path():
+def default_store_path() -> str:
     """Default path for token store."""
     return "/default/path/token.json"
 
 
 @pytest.fixture
-def mock_token_store(mocker, default_token_store_path):
+def prepare_identity(base_url) -> auth.AuthIdentity:
+    return auth.AuthIdentity(
+        host=str(base_url),
+        backend="oidc",
+        grant=auth.Grant.DEVICE_CODE,
+        scopes=["openid"],
+    )
+
+
+@pytest.fixture
+def mock_token_store(mocker, default_store_path):
     """Mock TokenStore class with sensible defaults."""
     mock_cls = mocker.patch.object(auth, "TokenStore", spec=True)
     mock_instance = mock_cls.return_value
-    mock_instance._path = default_token_store_path
+    mock_instance.path = default_store_path
     return mock_cls, mock_instance
 
 
@@ -61,7 +71,7 @@ def mock_token_store(mocker, default_token_store_path):
         "with_expired_both",
     ],
 )
-def token_store_content(request, base_url):
+def token_store_entry(request, prepare_identity):
     """
     Fixture providing different token store states.
 
@@ -74,25 +84,27 @@ def token_store_content(request, base_url):
     """
     has_token, expiry_factor = request.param
     if not has_token:
-        return {}
+        return None
 
     now = datetime.now(timezone.utc)
     expires = now + timedelta(hours=1) * (expiry_factor - 0.5)
     refresh_expires = now + timedelta(hours=1) * (expiry_factor + 1)
 
-    return {
-        str(base_url): {
+    return auth.StoreEntry.from_dict(
+        {
+            "identity": prepare_identity.to_dict(),
             "token": make_oidc_token(expires, refresh_expires),
             "stored_at": (now - timedelta(hours=4)).timestamp(),
+            "parent": None,
         }
-    }
+    )
 
 
 @pytest.fixture(
     params=[[True, None], [True, "/path/to/token.json"], [False, None]],
     ids=["no_store_path", "custom_store_path", "no_initial_token"],
 )
-def token_auth_instance(request, base_url, mock_token_store, token_store_content):
+def token_auth_instance(request, base_url, mock_token_store, token_store_entry):
     """
     Fixture providing a TokenAuth instance with mocked dependencies.
 
@@ -105,20 +117,23 @@ def token_auth_instance(request, base_url, mock_token_store, token_store_content
     _, mock_instance = mock_token_store
 
     if token_store_path:
-        mock_instance._path = token_store_path
+        mock_instance.path = token_store_path
 
-    # Configure mock to return token data based on token_store_content
-    mock_instance.get.side_effect = lambda key: token_store_content.get(str(key), {}).get("token")
+    # Configure mock to return token data based on token_store_entry
+    mock_instance.get.return_value = token_store_entry.token if token_store_entry else None
+    mock_instance.get_entry.return_value = token_store_entry if token_store_entry else None
+    mock_instance.put.return_value = token_store_entry
 
     token_auth = auth.TokenAuth(
         base_url=base_url,
-        token_store_path=token_store_path,
+        store_path=token_store_path,
         timeout=10,
         app_name="auth-test",
+        backend="oidc",
     )
-
-    if token_set and base_url in token_store_content:
-        token_auth.auth_token = token_store_content[str(base_url)]["token"]
+    token_auth.store_entry = token_store_entry
+    if not token_set:
+        token_auth.token = None
 
     return token_auth
 
@@ -140,7 +155,7 @@ def test_token_auth_init(token_auth_instance, mock_token_store):
     assert all(call[1]["app_name"] == "auth-test" for call in mock_cls.call_args_list)
 
     # Check token_store_path is set correctly on the instance
-    assert token_auth_instance.token_store_path == mock_instance._path
+    assert token_auth_instance.store_path == mock_instance.path
 
 
 # =============================================================================
@@ -185,40 +200,43 @@ async def test_async_authenticate_calls_oidc_client(
 # =============================================================================
 
 
-def test_update_token_or_store(token_auth_instance, mock_token_store, base_url):
-    """Test _update_token_or_store syncs auth_token with token store correctly."""
+def test_update_token_or_store(token_auth_instance, mock_token_store, prepare_identity):
+    """Test _update_token_or_store syncs token with token store correctly."""
     _, mock_instance = mock_token_store
+    identity = prepare_identity
 
     # Start with no auth token
-    token_auth_instance.auth_token = None
+    token_auth_instance.token = None
     token_auth_instance._update_token_or_store()
 
     # Check behavior based on whether store has a token
-    stored_token = mock_instance.get(str(base_url))
+    stored_token = mock_instance.get(identity)
+
     if stored_token:
-        # If store has token and auth_token was None, auth_token should be updated from store
-        assert token_auth_instance.auth_token == stored_token
+        # If store has token and token was None, token should be updated from store
+        assert token_auth_instance.token == stored_token
     else:
-        # If store has no token, auth_token should be written to store
-        mock_instance.put.assert_called_once_with(host=str(base_url), token=None)
+        # If store has no token, token should be written to store
+        mock_instance.put.assert_called_once_with(identity=identity, token=None)
 
 
-def test_validate_token_store(token_auth_instance, mock_token_store, mocker, base_url):
+def test_validate_token_store(token_auth_instance, mock_token_store, mocker, prepare_identity):
     """Test _validate_token_store loads token from store or triggers authentication."""
     _, mock_instance = mock_token_store
     mocked_authenticate = mocker.patch.object(auth.TokenAuth, "_authenticate")
     mocked_update = mocker.patch.object(token_auth_instance, "_update_token_or_store")
+    identity = prepare_identity
 
     # Get the token from store (if any)
-    stored_token = mock_instance.get(str(base_url))
+    store_entry = mock_instance.get_entry(identity)
 
-    # token_auth_instance starts with auth_token=None (from fixture)
+    # token_auth_instance starts with token=None (from fixture)
     token_auth_instance._validate_token_store()
 
     # Check the correct branch was taken based on stored token state
-    if stored_token:
-        # Token in store, no auth_token initially -> should load from store
-        assert token_auth_instance.auth_token == stored_token
+    if store_entry:
+        # Token in store, no token initially -> should load from store
+        assert token_auth_instance.token == store_entry.token
         mocked_authenticate.assert_not_called()
     else:
         # No token in store, no auth_token initially -> should call _authenticate
@@ -234,7 +252,7 @@ def test_validate_token_no_token_non_interactive_raises(
     token_auth_instance._interactive = False
     _, mock_instance = mock_token_store
     stored_token = mock_instance.get(str(base_url))
-    if not (stored_token or token_auth_instance.auth_token):
+    if not (stored_token or token_auth_instance.token):
         with pytest.raises(
             auth.AuthError,
             match=r"Token store does not contain token for.*. New token can only be generated in interactive mode.",
@@ -244,7 +262,7 @@ def test_validate_token_no_token_non_interactive_raises(
 
 @pytest.mark.asyncio
 async def test_async_validate_token_store(
-    mocker: MockerFixture, token_auth_instance, mock_token_store, base_url
+    mocker: MockerFixture, token_auth_instance, mock_token_store, prepare_identity
 ):
     """Test _async_validate_token_store loads token from store or triggers authentication."""
     _, mock_instance = mock_token_store
@@ -252,20 +270,21 @@ async def test_async_validate_token_store(
         auth.TokenAuth, "_async_authenticate", new_callable=mocker.AsyncMock
     )
     mocked_update = mocker.patch.object(token_auth_instance, "_update_token_or_store")
+    identity = prepare_identity
 
     # Get the token from store (if any)
-    stored_token = mock_instance.get(str(base_url))
+    store_entry = mock_instance.get_entry(identity)
 
-    # token_auth_instance starts with auth_token=None (from fixture)
+    # token_auth_instance starts with token=None (from fixture)
     await token_auth_instance._async_validate_token_store()
 
     # Check the correct branch was taken based on stored token state
-    if stored_token:
-        # Token in store, no auth_token initially -> should load from store
-        assert token_auth_instance.auth_token == stored_token
+    if store_entry:
+        # Token in store, no token initially -> should load from store
+        assert token_auth_instance.token == store_entry.token
         mocked_authenticate.assert_not_called()
     else:
-        # No token in store, no auth_token initially -> should call _authenticate
+        # No token in store, no token initially -> should call _authenticate
         mocked_authenticate.assert_called_once()
 
     # _update_token_or_store should always be called
@@ -279,7 +298,7 @@ async def test_async_validate_token_no_token_non_interactive_raises(
     token_auth_instance._interactive = False
     _, mock_instance = mock_token_store
     stored_token = mock_instance.get(str(base_url))
-    if not (stored_token or token_auth_instance.auth_token):
+    if not (stored_token or token_auth_instance.token):
         with pytest.raises(
             auth.AuthError,
             match=r"Token store does not contain token for.*. New token can only be generated in interactive mode.",
@@ -288,7 +307,7 @@ async def test_async_validate_token_no_token_non_interactive_raises(
 
 
 def test_validate_token_refreshes_expired_tokens(
-    token_auth_instance, mock_token_store, mocker, base_url, token_store_content
+    token_auth_instance, mock_token_store, mocker, token_store_entry
 ):
     """Test _validate_token refreshes tokens when expired and raises on invalid refresh tokens."""
     _, mock_instance = mock_token_store
@@ -304,15 +323,15 @@ def test_validate_token_refreshes_expired_tokens(
     mocked_authenticate.return_value = fresh_token
 
     # Determine which token scenario we're testing
-    stored_token_data = token_store_content.get(str(base_url), {}).get("token")
+    stored_token_data = token_store_entry.token if token_store_entry else None
 
     if stored_token_data:
-        auth_token = stored_token_data
+        token = stored_token_data
     else:
-        auth_token = fresh_token
+        token = fresh_token
 
-    refresh_expires_dt = datetime.fromtimestamp(auth_token["refresh_expires"], tz=timezone.utc)
-    expires_dt = datetime.fromtimestamp(auth_token["expires"], tz=timezone.utc)
+    refresh_expires_dt = datetime.fromtimestamp(token["refresh_expires"], tz=timezone.utc)
+    expires_dt = datetime.fromtimestamp(token["expires"], tz=timezone.utc)
     now_dt = datetime.now(timezone.utc)
 
     if refresh_expires_dt < now_dt:
@@ -334,12 +353,12 @@ def test_validate_token_refreshes_expired_tokens(
     else:
         # Both tokens valid -> should return stored token
         returned_token = token_auth_instance._validate_token()
-        assert returned_token == auth_token
+        assert returned_token == token
 
 
 @pytest.mark.asyncio
 async def test_async_validate_token_refreshes_expired_tokens(
-    mocker: MockerFixture, token_auth_instance, mock_token_store, base_url, token_store_content
+    mocker: MockerFixture, token_auth_instance, mock_token_store, token_store_entry
 ):
     """Test _validate_token refreshes tokens when expired and raises on invalid refresh tokens."""
     _, mock_instance = mock_token_store
@@ -355,15 +374,15 @@ async def test_async_validate_token_refreshes_expired_tokens(
     mocked_authenticate.return_value = fresh_token
 
     # Determine which token scenario we're testing
-    stored_token_data = token_store_content.get(str(base_url), {}).get("token")
+    stored_token_data = token_store_entry.token if token_store_entry else None
 
     if stored_token_data:
-        auth_token = stored_token_data
+        token = stored_token_data
     else:
-        auth_token = fresh_token
+        token = fresh_token
 
-    refresh_expires_dt = datetime.fromtimestamp(auth_token["refresh_expires"], tz=timezone.utc)
-    expires_dt = datetime.fromtimestamp(auth_token["expires"], tz=timezone.utc)
+    refresh_expires_dt = datetime.fromtimestamp(token["refresh_expires"], tz=timezone.utc)
+    expires_dt = datetime.fromtimestamp(token["expires"], tz=timezone.utc)
     now_dt = datetime.now(timezone.utc)
 
     if refresh_expires_dt < now_dt:
@@ -385,12 +404,12 @@ async def test_async_validate_token_refreshes_expired_tokens(
     else:
         # Both tokens valid -> should return stored token
         returned_token = await token_auth_instance._async_validate_token()
-        assert returned_token == auth_token
+        assert returned_token == token
 
 
 @pytest.mark.parametrize(argnames="interactive", argvalues=[True, False])
 def test_validate_token_raises_on_auth_failure(
-    token_auth_instance, mock_token_store, mocker, base_url, token_store_content, interactive
+    token_auth_instance, mock_token_store, mocker, base_url, token_store_entry, interactive
 ):
     """Test _validate_token raises AuthError when token refresh fails."""
     _, _ = mock_token_store
@@ -404,11 +423,11 @@ def test_validate_token_raises_on_auth_failure(
     )
     mocked_authenticate.return_value = fresh_token
 
-    stored_token_data = token_store_content.get(str(base_url), {}).get("token")
-    auth_token = stored_token_data or fresh_token
+    stored_token_data = token_store_entry.token if token_store_entry else None
+    token = stored_token_data or fresh_token
 
-    refresh_expires_dt = datetime.fromtimestamp(auth_token["refresh_expires"], tz=timezone.utc)
-    expires_dt = datetime.fromtimestamp(auth_token["expires"], tz=timezone.utc)
+    refresh_expires_dt = datetime.fromtimestamp(token["refresh_expires"], tz=timezone.utc)
+    expires_dt = datetime.fromtimestamp(token["expires"], tz=timezone.utc)
     now_dt = datetime.now(timezone.utc)
     if token_auth_instance._interactive:
         mocked_authenticate.side_effect = Exception("Auth failed")
@@ -426,7 +445,7 @@ def test_validate_token_raises_on_auth_failure(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(argnames="interactive", argvalues=[True, False])
 async def test_async_validate_token_raises_on_auth_failure(
-    token_auth_instance, mock_token_store, mocker, base_url, token_store_content, interactive
+    token_auth_instance, mock_token_store, mocker, token_store_entry, interactive
 ):
     """Test _async_validate_token raises AuthError when token refresh fails."""
     _, _ = mock_token_store
@@ -440,11 +459,11 @@ async def test_async_validate_token_raises_on_auth_failure(
     )
     mocked_authenticate.return_value = fresh_token
 
-    stored_token_data = token_store_content.get(str(base_url), {}).get("token")
-    auth_token = stored_token_data or fresh_token
+    stored_token_data = token_store_entry.token if token_store_entry else None
+    token = stored_token_data or fresh_token
 
-    refresh_expires_dt = datetime.fromtimestamp(auth_token["refresh_expires"], tz=timezone.utc)
-    expires_dt = datetime.fromtimestamp(auth_token["expires"], tz=timezone.utc)
+    refresh_expires_dt = datetime.fromtimestamp(token["refresh_expires"], tz=timezone.utc)
+    expires_dt = datetime.fromtimestamp(token["expires"], tz=timezone.utc)
     now_dt = datetime.now(timezone.utc)
 
     if (refresh_expires_dt < now_dt or expires_dt < now_dt) and token_auth_instance._interactive:
@@ -465,7 +484,7 @@ async def test_async_validate_token_raises_on_auth_failure(
 
 
 def test_get_auth_headers(
-    token_auth_instance, mock_token_store, mocker, base_url, token_store_content
+    token_auth_instance, mock_token_store, mocker, base_url, token_store_entry
 ):
     """Test get_auth_headers returns correct headers and handles token refresh."""
     _, mock_instance = mock_token_store
@@ -478,11 +497,11 @@ def test_get_auth_headers(
     )
     mocked_authenticate.return_value = fresh_token
 
-    stored_token_data = token_store_content.get(str(base_url), {}).get("token")
-    auth_token = stored_token_data or fresh_token
+    stored_token_data = token_store_entry.token if token_store_entry else None
+    token = stored_token_data or fresh_token
 
-    refresh_expires_dt = datetime.fromtimestamp(auth_token["refresh_expires"], tz=timezone.utc)
-    expires_dt = datetime.fromtimestamp(auth_token["expires"], tz=timezone.utc)
+    refresh_expires_dt = datetime.fromtimestamp(token["refresh_expires"], tz=timezone.utc)
+    expires_dt = datetime.fromtimestamp(token["expires"], tz=timezone.utc)
     now_dt = datetime.now(timezone.utc)
 
     if refresh_expires_dt < now_dt:
@@ -496,18 +515,18 @@ def test_get_auth_headers(
         assert mock_instance.put.call_count == 2
         assert "Authorization" in auth_headers
         assert "Bearer" in auth_headers["Authorization"]
-        assert auth_token["access_token"] in auth_headers["Authorization"]
+        assert token["access_token"] in auth_headers["Authorization"]
     else:
         # Valid token -> should return headers directly
         auth_headers = token_auth_instance.get_auth_headers()
         assert "Authorization" in auth_headers
         assert "Bearer" in auth_headers["Authorization"]
-        assert auth_token["access_token"] in auth_headers["Authorization"]
+        assert token["access_token"] in auth_headers["Authorization"]
 
 
 @pytest.mark.asyncio
 async def test_async_get_auth_headers(
-    mocker: MockerFixture, token_auth_instance, mock_token_store, base_url, token_store_content
+    mocker: MockerFixture, token_auth_instance, mock_token_store, base_url, token_store_entry
 ):
     """Test get_auth_headers returns correct headers and handles token refresh."""
     _, mock_instance = mock_token_store
@@ -520,11 +539,11 @@ async def test_async_get_auth_headers(
     )
     mocked_authenticate.return_value = fresh_token
 
-    stored_token_data = token_store_content.get(str(base_url), {}).get("token")
-    auth_token = stored_token_data or fresh_token
+    stored_token_data = token_store_entry.token if token_store_entry else None
+    token = stored_token_data or fresh_token
 
-    refresh_expires_dt = datetime.fromtimestamp(auth_token["refresh_expires"], tz=timezone.utc)
-    expires_dt = datetime.fromtimestamp(auth_token["expires"], tz=timezone.utc)
+    refresh_expires_dt = datetime.fromtimestamp(token["refresh_expires"], tz=timezone.utc)
+    expires_dt = datetime.fromtimestamp(token["expires"], tz=timezone.utc)
     now_dt = datetime.now(timezone.utc)
 
     if refresh_expires_dt < now_dt:
@@ -538,13 +557,13 @@ async def test_async_get_auth_headers(
         assert mock_instance.put.call_count == 2
         assert "Authorization" in auth_headers
         assert "Bearer" in auth_headers["Authorization"]
-        assert auth_token["access_token"] in auth_headers["Authorization"]
+        assert token["access_token"] in auth_headers["Authorization"]
     else:
         # Valid token -> should return headers directly
         auth_headers = await token_auth_instance.async_get_auth_headers()
         assert "Authorization" in auth_headers
         assert "Bearer" in auth_headers["Authorization"]
-        assert auth_token["access_token"] in auth_headers["Authorization"]
+        assert token["access_token"] in auth_headers["Authorization"]
 
 
 # =============================================================================
@@ -561,7 +580,7 @@ def test_sync_auth_flow_passes_through_non_401(mocker, httpx_mock: HTTPXMock):
         base_url="https://myinstance.com",
         auth=auth.TokenAuth(
             base_url="https://myinstance.com",
-            token_store_path=None,
+            store_path=None,
             timeout=10,
             app_name="auth-test",
         ),
@@ -582,7 +601,7 @@ async def test_async_auth_flow_passes_through_non_401(mocker, httpx_mock: HTTPXM
         base_url="https://myinstance.com",
         auth=auth.TokenAuth(
             base_url="https://myinstance.com",
-            token_store_path=None,
+            store_path=None,
             timeout=10,
             app_name="auth-test",
         ),
@@ -604,7 +623,7 @@ def test_sync_auth_flow_retry_on_401(mocker, httpx_mock: HTTPXMock):
         base_url="https://myinstance.com",
         auth=auth.TokenAuth(
             base_url="https://myinstance.com",
-            token_store_path=None,
+            store_path=None,
             timeout=10,
             app_name="auth-test",
         ),
@@ -628,7 +647,7 @@ async def test_async_auth_flow_retry_on_401(mocker, httpx_mock: HTTPXMock):
         base_url="https://myinstance.com",
         auth=auth.TokenAuth(
             base_url="https://myinstance.com",
-            token_store_path=None,
+            store_path=None,
             timeout=10,
             app_name="auth-test",
         ),
