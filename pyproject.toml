@@ -32,7 +32,7 @@ dependencies = [
     # add your dependencies here
     "httpx",
     "pydantic",
-    "py_oidc_auth_client",
+    "py_oidc_auth_client>=2609.0.0",
     "nest_asyncio",
     "pillow",
 ]

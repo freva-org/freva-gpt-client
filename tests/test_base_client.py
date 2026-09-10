@@ -99,7 +99,7 @@ class TestBaseClient:
         # because the auth token is cached, the underlying TokenAuth should only be called once.
         mocked_token_auth.assert_called_once_with(
             base_url=base_client.auth_url,
-            token_store_path=base_client._token_store_path,
+            store_path=base_client._token_store_path,
             interactive=True,
         )
 
